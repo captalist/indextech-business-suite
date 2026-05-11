@@ -1,0 +1,15 @@
+services:
+  indextech-suite:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-production}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      NODE_ENV: production
+    volumes:
+      - suite-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  suite-data:
