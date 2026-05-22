@@ -83,6 +83,19 @@ input[readonly]{background:#f8fafc;cursor:default}
 /* TOAST */
 .toast{position:fixed;bottom:1.5rem;right:1.5rem;background:#1a2332;color:white;padding:10px 18px;border-radius:9px;font-size:.83rem;z-index:9999;opacity:0;transition:opacity .3s;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.3)}
 .toast.show{opacity:1}
+/* POPUP NOTIFICATIONS */
+#notify-stack{position:fixed;top:1rem;right:1rem;z-index:10001;display:flex;flex-direction:column;gap:.5rem;max-width:min(360px,calc(100vw - 2rem));pointer-events:none}
+.notify-popup{pointer-events:auto;background:#fff;border:1px solid #c5d3e8;border-left:4px solid var(--accent);border-radius:10px;padding:.85rem 2.2rem .85rem .9rem;box-shadow:0 8px 28px rgba(10,37,64,.18);animation:notifyIn .35s ease;font-size:.82rem}
+.notify-popup.task{border-left-color:#2563eb}
+.notify-popup.cal{border-left-color:#059669}
+.notify-popup.sales{border-left-color:#d97706}
+.notify-popup strong{display:block;color:#0a2540;margin-bottom:.2rem;font-size:.88rem}
+.notify-popup p{margin:0;color:#4a5568;line-height:1.4}
+.notify-popup .notify-x{position:absolute;top:.45rem;right:.5rem;border:none;background:transparent;color:#718096;font-size:1.1rem;cursor:pointer;line-height:1;padding:2px 6px}
+@keyframes notifyIn{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
+.perm-toolbar{display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.35rem}
+.perm-select{width:100%;min-height:11rem;font-size:.8rem;border:1px solid var(--border);border-radius:8px;padding:.35rem}
+.perm-hint{font-size:.75rem;color:var(--muted);margin-top:.25rem}
 
 /* MODAL */
 .modal-bg{display:none;position:fixed;inset:0;background:rgba(5,20,40,.75);z-index:1000;padding:1rem;overflow-y:auto;backdrop-filter:blur(2px)}
@@ -224,6 +237,7 @@ body.rbac-ok #login-gate{display:none!important}
 </head>
 <body>
 <div id="toast" class="toast"></div>
+<div id="notify-stack" aria-live="polite"></div>
 
 <div id="login-gate" class="login-gate">
   <div class="login-card">
@@ -838,7 +852,7 @@ body.rbac-ok #login-gate{display:none!important}
     </div>
     <div class="card" id="rbac-users-card" style="margin-top:1.25rem;display:none">
       <div class="card-title">Users &amp; roles (RBAC)</div>
-      <p style="font-size:.83rem;color:var(--muted);margin-bottom:1rem">Only administrators can create users. Passwords are stored as a hash in this browser (local-first; not for public internet exposure).</p>
+      <p style="font-size:.83rem;color:var(--muted);margin-bottom:1rem">Create users and choose exactly which modules and actions each person can access. Existing business data in the server database is not changed when you edit users.</p>
       <div class="toolbar" style="margin-bottom:.75rem">
         <button type="button" class="btn btn-primary btn-sm" onclick="openRbacUserModal(null)">+ Add user</button>
       </div>
@@ -856,9 +870,20 @@ body.rbac-ok #login-gate{display:none!important}
     <div class="fg">
       <div class="f full"><label>Username</label><input id="rbac-m-user" placeholder="unique login" autocomplete="off"></div>
       <div class="f full"><label>Display name</label><input id="rbac-m-disp" placeholder="Shown in header"></div>
-      <div class="f full"><label>Role</label>
-        <select id="rbac-m-role"></select>
+      <div class="f full"><label>Role (template)</label>
+        <select id="rbac-m-role" onchange="rbacOnRoleTemplateChange()"></select>
       </div>
+      <div class="f full">
+        <label>Permissions</label>
+        <div class="perm-toolbar">
+          <button type="button" class="btn btn-secondary btn-sm" onclick="rbacApplyRoleTemplate()">Apply role template</button>
+          <button type="button" class="btn btn-secondary btn-sm" onclick="rbacPermSelectAll()">Select all</button>
+          <button type="button" class="btn btn-secondary btn-sm" onclick="rbacPermClearAll()">Clear all</button>
+        </div>
+        <select id="rbac-m-perms" class="perm-select" multiple title="Hold Ctrl (Windows) or Cmd (Mac) to select multiple"></select>
+        <p class="perm-hint">Choose every function this user may use. Hold <kbd>Ctrl</kbd> and click to toggle items. Saving stores your selection on the server.</p>
+      </div>
+      <div class="f full"><label><input type="checkbox" id="rbac-m-use-role-defaults"> Use role defaults only (ignore custom list above)</label></div>
       <div class="f full"><label>Password</label><input id="rbac-m-pass" type="password" placeholder="New user: required · Edit: leave blank to keep" autocomplete="new-password"></div>
       <div class="f full"><label>Active</label>
         <select id="rbac-m-active"><option value="1">Active</option><option value="0">Disabled</option></select>
@@ -1129,6 +1154,10 @@ async function loadFullStateFromServer(){
   tkn = parseInt(seq.tkn, 10) || 1;
   pon = parseInt(seq.pon, 10) || 1;
   if(st.company && typeof st.company === 'object') Object.assign(CO, st.company);
+  if(st.me && Array.isArray(st.me.permissions)){
+    const s = rbacGetSession();
+    if(s){ s.permissions = st.me.permissions; rbacSetSession(s, !!localStorage.getItem('it_sess')); rbacApplyNav(); }
+  }
 }
 let cachedRbacUsers = [];
 async function rbacFetchUsers(){
@@ -1417,9 +1446,12 @@ async function saveDeal(){
     title: gv('deal-m-title'), value: parseFloat(gv('deal-m-value'))||0, stage: document.getElementById('deal-m-stage').value,
     close: gv('deal-m-close'), contactId: cid||'', custName: c ? c.name : '', updated: new Date().toISOString() };
   if(!o.title){ toast('Title required'); return; }
+  const isNew = dealEditId==null;
   if(dealEditId!=null) salesList[dealEditId]=o; else salesList.unshift(o);
   try{
     await persistSales();
+    notifyMarkLocalChange();
+    if(isNew) notifyPollOnce(false);
     closeDealModal(); renderSales(); toast('Opportunity saved');
   }catch(e){}
 }
@@ -1507,8 +1539,10 @@ function closeWOModal(){ document.getElementById('wo-modal').classList.remove('o
 function editWO(i){ const w=workOrders[i]; if(!w)return; woEditId=i; sv('wo-m-cust',w.customer||'');sv('wo-m-phone',w.phone||'');sv('wo-m-device',w.device||'');sv('wo-m-issue',w.issue||'');sv('wo-m-tech',w.tech||'');document.getElementById('wo-m-status').value=w.status||'New';sv('wo-m-date',w.scheduled||''); document.getElementById('wo-modal').classList.add('open'); }
 async function saveWorkOrder(){
   const o = { customer: gv('wo-m-cust'), phone: gv('wo-m-phone'), device: gv('wo-m-device'), issue: gv('wo-m-issue'),
-    tech: gv('wo-m-tech'), status: document.getElementById('wo-m-status').value, scheduled: gv('wo-m-date') };
+    tech: gv('wo-m-tech'), status: document.getElementById('wo-m-status').value, scheduled: gv('wo-m-date'),
+    updated: new Date().toISOString() };
   if(!o.customer){ toast('Customer required'); return; }
+  const isNew = woEditId==null;
   if(woEditId!=null){
     const w = workOrders[woEditId];
     Object.assign(w, o);
@@ -1519,6 +1553,8 @@ async function saveWorkOrder(){
   }
   try{
     await persistWO();
+    notifyMarkLocalChange();
+    if(isNew) notifyPollOnce(false);
     closeWOModal(); renderWorkOrders(); toast('Work order saved');
   }catch(e){}
 }
@@ -1555,10 +1591,13 @@ async function saveCalEvent(){
   const o = { id: calEditId!=null && calEvents[calEditId] ? calEvents[calEditId].id : 'ev'+Date.now(),
     title: gv('cal-m-title'), date: gv('cal-m-date'), time: gv('cal-m-time'), cat: document.getElementById('cal-m-cat').value, notes: gv('cal-m-notes') };
   if(!o.title || !o.date){ toast('Title and date required'); return; }
+  const isNew = calEditId==null;
   if(calEditId!=null) calEvents[calEditId]=o; else calEvents.push(o);
   calEvents.sort((a,b)=>(a.date||'').localeCompare(b.date||''));
   try{
     await persistCal();
+    notifyMarkLocalChange();
+    if(isNew) notifyPollOnce(false);
     closeCalModal(); renderCalendar(); toast('Event saved');
   }catch(e){}
 }
@@ -1968,6 +2007,56 @@ function sv(id,v){const e=document.getElementById(id);if(e)e.value=v;}
 function fmt(n){return Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function fd(d){if(!d)return'____________';const dt=new Date(d+'T12:00:00');return dt.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3000);}
+/* ========== LIVE NOTIFICATIONS ========== */
+let notifyPollerId=null,notifyReady=false,notifyBaseline={wo:{},cal:{},sales:{}},notifySuppressUntil=0;
+function notifySigWo(w){return (w.tech||'')+'|'+(w.updated||'')+'|'+(w.customer||'');}
+function notifySigCal(e){return (e.date||'')+'|'+(e.time||'')+'|'+(e.title||'');}
+function notifySigSales(s){return (s.updated||'')+'|'+(s.title||'')+'|'+(s.custName||'');}
+function showNotifyPopup(kind,title,body){
+  const stack=document.getElementById('notify-stack');if(!stack)return;
+  const el=document.createElement('div');
+  el.className='notify-popup '+kind;
+  el.innerHTML='<button type="button" class="notify-x" aria-label="Dismiss">×</button><strong>'+esc(title)+'</strong><p>'+esc(body)+'</p>';
+  el.querySelector('.notify-x').onclick=()=>el.remove();
+  stack.appendChild(el);
+  setTimeout(()=>{if(el.parentNode)el.remove();},12000);
+}
+function notifyMarkLocalChange(){notifySuppressUntil=Date.now()+8000;}
+function notifyApplySnapshot(snap,initial){
+  const alerts=[];
+  (snap.wo||[]).forEach(w=>{
+    const sig=notifySigWo(w);
+    if(!notifyBaseline.wo[w.id]){if(!initial)alerts.push({kind:'task',title:'New task assigned',body:(w.num||'Work order')+(w.customer?' — '+w.customer:'')+(w.tech?' · '+w.tech:'')});}
+    else if(notifyBaseline.wo[w.id]!==sig&&w.tech&&!initial)alerts.push({kind:'task',title:'Task updated',body:(w.num||'Work order')+' assigned to '+w.tech});
+    notifyBaseline.wo[w.id]=sig;
+  });
+  (snap.cal||[]).forEach(e=>{
+    if(!notifyBaseline.cal[e.id]){if(!initial)alerts.push({kind:'cal',title:'New calendar event',body:(e.title||'Event')+(e.date?' · '+fd(e.date):'')});}
+    notifyBaseline.cal[e.id]=notifySigCal(e);
+  });
+  (snap.sales||[]).forEach(s=>{
+    if(!notifyBaseline.sales[s.id]){if(!initial)alerts.push({kind:'sales',title:'New sales opportunity',body:(s.title||'Deal')+(s.custName?' — '+s.custName:'')});}
+    notifyBaseline.sales[s.id]=notifySigSales(s);
+  });
+  if(!initial&&Date.now()>notifySuppressUntil)alerts.forEach(a=>showNotifyPopup(a.kind,a.title,a.body));
+}
+async function notifyPollOnce(initial){
+  try{
+    const r=await apiFetch('/notify-snapshot');
+    if(!r.ok)return;
+    const snap=await r.json();
+    notifyApplySnapshot(snap,!!initial);
+    notifyReady=true;
+  }catch(e){}
+}
+function startNotifyPoller(){
+  stopNotifyPoller();
+  notifyReady=false;
+  notifyBaseline={wo:{},cal:{},sales:{}};
+  notifyPollOnce(true);
+  notifyPollerId=setInterval(()=>notifyPollOnce(false),45000);
+}
+function stopNotifyPoller(){if(notifyPollerId){clearInterval(notifyPollerId);notifyPollerId=null;}}
 function esc(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 /* ========== RBAC ========== */
@@ -1980,16 +2069,54 @@ const ROLE_DEFS={
   accountant:{label:'Accountant',permissions:['dashboard','calendar','invoice','finance','procurement','assets','reports','history','agreement','data_export']},
   viewer:{label:'Viewer',permissions:['dashboard','calendar','reports','history']}
 };
+const PERM_LABELS={
+  dashboard:'Dashboard',calendar:'Calendar & events',crm:'CRM & contacts',sales:'Sales pipeline',quotes:'Quotes & estimates',
+  invoice:'Invoices & delivery notes',inventory:'Inventory',warranty:'Warranty cards',service:'Technicians & jobs',
+  tickets:'Support tickets',projects:'Projects & tasks',assets:'Asset register',finance:'Finance & expenses',
+  procurement:'Procurement & vendors',hr:'HR & directory',agreement:'Sales agreements',history:'Document center',
+  reports:'Reports',settings_company:'Company settings',data_export:'Export / backup data',docs_delete:'Delete records',
+  users_manage:'Manage users & permissions'
+};
+const ALL_PERMISSION_KEYS=[
+  'dashboard','calendar','crm','sales','quotes','invoice','inventory','warranty','service','tickets','projects','assets',
+  'finance','procurement','hr','agreement','history','reports','settings_company','data_export','docs_delete','users_manage'
+];
+function rbacRoleTemplatePerms(role){
+  const def=ROLE_DEFS[role];if(!def)return[];
+  if(def.permissions.includes('*'))return ALL_PERMISSION_KEYS.slice();
+  return def.permissions.slice();
+}
 function rbacSaveUsers(_arr){ /* users stored in server database only */ }
 function rbacGetSession(){try{const r=sessionStorage.getItem('it_sess')||localStorage.getItem('it_sess');return r?JSON.parse(r):null;}catch(e){return null;}}
 function rbacSetSession(o,remember){const j=JSON.stringify(o);sessionStorage.setItem('it_sess',j);if(remember)localStorage.setItem('it_sess',j);else localStorage.removeItem('it_sess');}
-function rbacClearSession(){sessionStorage.removeItem('it_sess');localStorage.removeItem('it_sess');}
-function hasPermission(key){
-  const s=rbacGetSession();if(!s)return false;
-  const def=ROLE_DEFS[s.role];if(!def)return false;
-  if(def.permissions.includes('*'))return true;
-  return def.permissions.includes(key);
+function rbacClearSession(){sessionStorage.removeItem('it_sess');localStorage.removeItem('it_sess');stopNotifyPoller();}
+function rbacEffectivePerms(){
+  const s=rbacGetSession();if(!s)return[];
+  if(Array.isArray(s.permissions)&&s.permissions.length)return s.permissions;
+  return rbacRoleTemplatePerms(s.role);
 }
+function hasPermission(key){
+  const perms=rbacEffectivePerms();
+  if(perms.includes('*'))return true;
+  return perms.includes(key);
+}
+function rbacInitPermSelect(){
+  const sel=document.getElementById('rbac-m-perms');if(!sel)return;
+  sel.innerHTML=ALL_PERMISSION_KEYS.map(k=>`<option value="${k}">${esc(PERM_LABELS[k]||k)}</option>`).join('');
+}
+function rbacSetPermSelection(keys){
+  const sel=document.getElementById('rbac-m-perms');if(!sel)return;
+  const set=new Set(keys||[]);
+  Array.from(sel.options).forEach(o=>{o.selected=set.has(o.value);});
+}
+function rbacGetPermSelection(){
+  const sel=document.getElementById('rbac-m-perms');if(!sel)return[];
+  return Array.from(sel.selectedOptions).map(o=>o.value);
+}
+function rbacApplyRoleTemplate(){rbacSetPermSelection(rbacRoleTemplatePerms(document.getElementById('rbac-m-role').value));document.getElementById('rbac-m-use-role-defaults').checked=false;}
+function rbacOnRoleTemplateChange(){rbacApplyRoleTemplate();}
+function rbacPermSelectAll(){rbacSetPermSelection(ALL_PERMISSION_KEYS);}
+function rbacPermClearAll(){rbacSetPermSelection([]);}
 function canAccessPage(page){
   if(page==='settings')return hasPermission('settings_company')||hasPermission('users_manage');
   return hasPermission(page);
@@ -2038,7 +2165,7 @@ async function rbacTryLogin(){
     const r=await fetch((window.API_BASE||'')+'/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password:pass})});
     const data=await r.json().catch(()=>({}));
     if(!r.ok){toast(data.error||'Login failed');return;}
-    rbacSetSession({token:data.token,userId:data.user.id,username:data.user.username,displayName:data.user.displayName,role:data.user.role},remember);
+    rbacSetSession({token:data.token,userId:data.user.id,username:data.user.username,displayName:data.user.displayName,role:data.user.role,permissions:data.user.permissions||[]},remember);
     document.body.classList.add('rbac-ok');
     await loadFullStateFromServer();
     rbacAfterLoginInit();
@@ -2057,6 +2184,7 @@ function rbacAfterLoginInit(){
   const tr=new Date();const t0=new Date(tr.getFullYear(),tr.getMonth(),1).toISOString().split('T')[0];sv('rep-from',t0);sv('rep-to',tr.toISOString().split('T')[0]);
   rbacApplyNav();
   rbacGoDefaultPage();
+  startNotifyPoller();
 }
 function rbacFillRoleSelect(sel,cur){
   sel.innerHTML=Object.keys(ROLE_DEFS).map(k=>`<option value="${k}">${esc(ROLE_DEFS[k].label)}</option>`).join('');
@@ -2073,6 +2201,10 @@ async function openRbacUserModal(editId){
   iu.readOnly=!!u;
   sv('rbac-m-disp',u?u.displayName||'':'');
   rbacFillRoleSelect(document.getElementById('rbac-m-role'),u?u.role:'sales');
+  rbacInitPermSelect();
+  const useDefaults=u?!u.customPermissions:true;
+  document.getElementById('rbac-m-use-role-defaults').checked=useDefaults;
+  rbacSetPermSelection(u&&u.permissions?u.permissions:rbacRoleTemplatePerms(u?u.role:'sales'));
   document.getElementById('rbac-m-pass').value='';
   document.getElementById('rbac-m-active').value=u&&u.active===false?'0':'1';
   document.getElementById('rbac-user-modal').classList.add('open');
@@ -2085,15 +2217,19 @@ async function saveRbacUserForm(){
   const role=document.getElementById('rbac-m-role').value;
   const pass=document.getElementById('rbac-m-pass').value;
   const active=document.getElementById('rbac-m-active').value==='1';
+  const useRoleDefaults=document.getElementById('rbac-m-use-role-defaults').checked;
+  const permissions=rbacGetPermSelection();
+  if(!useRoleDefaults&&!permissions.length){toast('Select at least one permission or use role defaults');return;}
   if(!uname){toast('Username required');return;}
+  const permBody={useRoleDefaults,permissions:useRoleDefaults?undefined:permissions};
   try{
     if(!rbacEditUserId){
       if(!pass){toast('Password required for new user');return;}
-      const r=await apiFetch('/users',{method:'POST',body:JSON.stringify({username:uname,displayName:disp,role,password:pass,active})});
+      const r=await apiFetch('/users',{method:'POST',body:JSON.stringify({username:uname,displayName:disp,role,password:pass,active,...permBody})});
       const err=await r.json().catch(()=>({}));
       if(!r.ok){toast(err.error||'Could not create user');return;}
     }else{
-      const body={displayName:disp,role,active};
+      const body={displayName:disp,role,active,...permBody};
       if(pass) body.password=pass;
       const r=await apiFetch('/users/'+encodeURIComponent(rbacEditUserId),{method:'PATCH',body:JSON.stringify(body)});
       const err=await r.json().catch(()=>({}));
@@ -2136,6 +2272,7 @@ function renderRbacUsersTable(){
 }
 
 window.addEventListener('DOMContentLoaded',async ()=>{
+  rbacInitPermSelect();
   try{
     const h=await fetch((window.API_BASE||'')+'/api/health');
     if(!h.ok) throw new Error('bad');

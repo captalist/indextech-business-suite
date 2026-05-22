@@ -29,9 +29,16 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT
+  created_at TEXT,
+  permissions TEXT
 );
 `);
+
+try {
+  db.exec('ALTER TABLE users ADD COLUMN permissions TEXT');
+} catch {
+  /* column already exists */
+}
 
 const CO_DEFAULT = {
   name: 'IndexTech Digital Company',
@@ -86,11 +93,52 @@ const ROLE_DEFS = {
   viewer: { permissions: ['dashboard', 'calendar', 'reports', 'history'] },
 };
 
-function roleHasPerm(role, key) {
+/** All grantable permissions (modules + admin actions). */
+const ALL_PERMISSION_KEYS = [
+  'dashboard', 'calendar', 'crm', 'sales', 'quotes', 'invoice', 'inventory', 'warranty', 'service',
+  'tickets', 'projects', 'assets', 'finance', 'procurement', 'hr', 'agreement', 'history', 'reports',
+  'settings_company', 'data_export', 'docs_delete', 'users_manage',
+];
+
+function roleDefaultPermissions(role) {
   const def = ROLE_DEFS[role];
-  if (!def) return false;
-  if (def.permissions.includes('*')) return true;
-  return def.permissions.includes(key);
+  if (!def) return [];
+  if (def.permissions.includes('*')) return ALL_PERMISSION_KEYS.slice();
+  return def.permissions.slice();
+}
+
+function resolveUserPermissions(role, permissionsJson) {
+  if (permissionsJson != null && String(permissionsJson).trim() !== '') {
+    try {
+      const parsed = JSON.parse(permissionsJson);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed.filter((k) => ALL_PERMISSION_KEYS.includes(k) || k === '*');
+      }
+    } catch {
+      /* fall through to role */
+    }
+  }
+  return roleDefaultPermissions(role);
+}
+
+function sanitizePermissionsInput(perms) {
+  if (perms === undefined || perms === null) return null;
+  if (!Array.isArray(perms)) return null;
+  const out = [...new Set(perms.filter((k) => typeof k === 'string' && (k === '*' || ALL_PERMISSION_KEYS.includes(k))))];
+  return out.length ? out : null;
+}
+
+function userHasPerm(auth, key) {
+  const perms = auth.permissions || roleDefaultPermissions(auth.role);
+  if (perms.includes('*')) return true;
+  return perms.includes(key);
+}
+
+function attachAuthPermissions(req, _res, next) {
+  const u = db.prepare('SELECT role, permissions FROM users WHERE id = ?').get(req.auth.userId);
+  if (!u) return next();
+  req.auth.permissions = resolveUserPermissions(u.role, u.permissions);
+  next();
 }
 
 function ensureBlobDefaults() {
@@ -135,7 +183,7 @@ function authMiddleware(req, res, next) {
 
 function requirePerm(key) {
   return (req, res, next) => {
-    if (!roleHasPerm(req.auth.role, key)) return res.status(403).json({ error: 'Forbidden' });
+    if (!userHasPerm(req.auth, key)) return res.status(403).json({ error: 'Forbidden' });
     next();
   };
 }
@@ -143,7 +191,17 @@ function requirePerm(key) {
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
+const API_PUBLIC = new Set(['/health', '/auth/login']);
+app.use('/api', (req, res, next) => {
+  if (API_PUBLIC.has(req.path)) return next();
+  authMiddleware(req, res, () => attachAuthPermissions(req, res, next));
+});
+
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+app.get('/api/permissions', (_req, res) => {
+  res.json({ keys: ALL_PERMISSION_KEYS, roles: ROLE_DEFS });
+});
 
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body || {};
@@ -151,6 +209,7 @@ app.post('/api/auth/login', (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(String(username).trim());
   if (!u || !u.active) return res.status(401).json({ error: 'Invalid username or account disabled' });
   if (!bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({ error: 'Invalid password' });
+  const permissions = resolveUserPermissions(u.role, u.permissions);
   const token = jwt.sign(
     { userId: u.id, username: u.username, role: u.role, displayName: u.display_name || u.username },
     JWT_SECRET,
@@ -163,11 +222,48 @@ app.post('/api/auth/login', (req, res) => {
       username: u.username,
       displayName: u.display_name || u.username,
       role: u.role,
+      permissions,
+      customPermissions: u.permissions != null && String(u.permissions).trim() !== '',
     },
   });
 });
 
-app.get('/api/state', authMiddleware, (_req, res) => {
+function parseBlob(key) {
+  const row = db.prepare('SELECT value FROM blobs WHERE key = ?').get(key);
+  if (!row) return [];
+  try {
+    const v = JSON.parse(row.value);
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
+app.get('/api/notify-snapshot', (req, res) => {
+  const wo = parseBlob('wo').map((w) => ({
+    id: w.id,
+    num: w.num,
+    tech: w.tech,
+    customer: w.customer,
+    updated: w.updated,
+  }));
+  const cal = parseBlob('cal').map((e) => ({
+    id: e.id,
+    title: e.title,
+    date: e.date,
+    time: e.time,
+    cat: e.cat,
+  }));
+  const sales = parseBlob('sales').map((s) => ({
+    id: s.id,
+    title: s.title,
+    custName: s.custName,
+    updated: s.updated,
+  }));
+  res.json({ wo, cal, sales });
+});
+
+app.get('/api/state', (req, res) => {
   const get = (key) => {
     const row = db.prepare('SELECT value FROM blobs WHERE key = ?').get(key);
     if (!row) return null;
@@ -196,12 +292,16 @@ app.get('/api/state', authMiddleware, (_req, res) => {
     po: get('po') || [],
     employees: get('employees') || [],
     docs: get('docs') || [],
+    me: {
+      permissions: req.auth.permissions,
+      role: req.auth.role,
+    },
   });
 });
 
 const upsertBlob = db.prepare('INSERT INTO blobs (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
 
-app.put('/api/blobs', authMiddleware, (req, res) => {
+app.put('/api/blobs', (req, res) => {
   const body = req.body || {};
   const tx = db.transaction(() => {
     for (const [k, v] of Object.entries(body)) {
@@ -218,26 +318,46 @@ app.put('/api/blobs', authMiddleware, (req, res) => {
   }
 });
 
-app.get('/api/users', authMiddleware, requirePerm('users_manage'), (_req, res) => {
-  const rows = db.prepare('SELECT id, username, display_name AS displayName, role, active, created_at AS createdAt FROM users ORDER BY username').all();
-  res.json(rows.map((r) => ({ ...r, active: r.active !== 0 })));
+function mapUserRow(r) {
+  let permissions = null;
+  let customPermissions = false;
+  if (r.permissions != null && String(r.permissions).trim() !== '') {
+    customPermissions = true;
+    permissions = resolveUserPermissions(r.role, r.permissions);
+  }
+  return {
+    id: r.id,
+    username: r.username,
+    displayName: r.display_name,
+    role: r.role,
+    active: r.active !== 0,
+    createdAt: r.created_at,
+    permissions,
+    customPermissions,
+  };
+}
+
+app.get('/api/users', requirePerm('users_manage'), (_req, res) => {
+  const rows = db.prepare('SELECT * FROM users ORDER BY username').all();
+  res.json(rows.map(mapUserRow));
 });
 
-app.post('/api/users', authMiddleware, requirePerm('users_manage'), (req, res) => {
-  const { username, displayName, role, password, active } = req.body || {};
+app.post('/api/users', requirePerm('users_manage'), (req, res) => {
+  const { username, displayName, role, password, active, permissions, useRoleDefaults } = req.body || {};
   const uname = String(username || '')
     .toLowerCase()
     .trim();
   if (!uname) return res.status(400).json({ error: 'Username required' });
   if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
   if (!ROLE_DEFS[role]) return res.status(400).json({ error: 'Invalid role' });
+  const permJson = useRoleDefaults ? null : JSON.stringify(sanitizePermissionsInput(permissions) || roleDefaultPermissions(role));
   try {
     const hash = bcrypt.hashSync(password, 10);
     const id = 'u' + Date.now();
     db.prepare(
-      `INSERT INTO users (id, username, display_name, role, password_hash, active, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, uname, displayName || uname, role, hash, active === false ? 0 : 1, new Date().toISOString());
+      `INSERT INTO users (id, username, display_name, role, password_hash, active, created_at, permissions)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, uname, displayName || uname, role, hash, active === false ? 0 : 1, new Date().toISOString(), permJson);
     res.json({ ok: true, id });
   } catch (e) {
     if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(400).json({ error: 'Username already exists' });
@@ -245,9 +365,9 @@ app.post('/api/users', authMiddleware, requirePerm('users_manage'), (req, res) =
   }
 });
 
-app.patch('/api/users/:id', authMiddleware, requirePerm('users_manage'), (req, res) => {
+app.patch('/api/users/:id', requirePerm('users_manage'), (req, res) => {
   const { id } = req.params;
-  const { displayName, role, active, password } = req.body || {};
+  const { displayName, role, active, password, permissions, useRoleDefaults } = req.body || {};
   const u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   if (!u) return res.status(404).json({ error: 'Not found' });
   const nextRole = role !== undefined ? role : u.role;
@@ -268,17 +388,25 @@ app.patch('/api/users/:id', authMiddleware, requirePerm('users_manage'), (req, r
     hash = bcrypt.hashSync(password, 10);
   }
 
-  db.prepare(`UPDATE users SET display_name = ?, role = ?, active = ?, password_hash = ? WHERE id = ?`).run(
+  let nextPerms = u.permissions;
+  if (useRoleDefaults === true) nextPerms = null;
+  else if (permissions !== undefined) {
+    const sanitized = sanitizePermissionsInput(permissions);
+    nextPerms = sanitized ? JSON.stringify(sanitized) : null;
+  }
+
+  db.prepare(`UPDATE users SET display_name = ?, role = ?, active = ?, password_hash = ?, permissions = ? WHERE id = ?`).run(
     nextDisp,
     nextRole,
     nextActive,
     hash,
+    nextPerms,
     id
   );
   res.json({ ok: true });
 });
 
-app.delete('/api/users/:id', authMiddleware, requirePerm('users_manage'), (req, res) => {
+app.delete('/api/users/:id', requirePerm('users_manage'), (req, res) => {
   const { id } = req.params;
   if (req.auth.userId === id) return res.status(400).json({ error: 'You cannot delete your own account' });
   const u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
