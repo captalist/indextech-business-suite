@@ -1,45 +1,60 @@
 # Hosting INDEXTECH Enterprise Suite (central database)
 
-The app is served by **Node.js**. All business data lives in **SQLite** on the server (`data/suite.db` by default), so every employee who signs in sees the **same** CRM, inventory, invoices, and documents.
+The app is served by **Node.js**. All business data lives in a **separate PostgreSQL database** so application updates do not overwrite your data.
 
 ## Quick start (Windows / Mac / Linux)
+
+1. Install and start **PostgreSQL 14+**, then create the database:
+
+```sql
+CREATE USER suite WITH PASSWORD 'suite';
+CREATE DATABASE indextech_suite OWNER suite;
+```
+
+2. Run the app:
 
 ```bash
 cd /path/to/indextech-suite
 npm install
+set DATABASE_URL=postgresql://suite:suite@localhost:5432/indextech_suite
 npm start
 ```
 
-Open **http://localhost:8080** — default login: **admin** / **admin123** (set `ADMIN_PASSWORD` before exposing to the internet).
+On Linux/macOS use `export DATABASE_URL=...` instead of `set`.
+
+Open **http://localhost:8080** and sign in with your administrator account.
 
 ## Environment variables
 
 | Variable         | Purpose |
 |------------------|---------|
+| `DATABASE_URL`   | PostgreSQL connection string (required) |
 | `PORT`           | HTTP port (default `8080`) |
-| `DATA_DIR`       | Folder for `suite.db` (default `./data`) |
 | `JWT_SECRET`     | **Required in production** — signing key for sessions |
 | `ADMIN_PASSWORD` | Password for the seeded `admin` user (first run only) |
 | `NODE_ENV`       | `production` recommended when deployed |
 
-## Docker
+Default `DATABASE_URL` if unset: `postgresql://suite:suite@localhost:5432/indextech_suite`
+
+## Docker (recommended)
 
 ```bash
 docker compose up -d --build
 ```
 
-- Database persists in the **`suite-data`** Docker volume (under `/app/data` in the container).
-- Override secrets: create a `.env` next to `docker-compose.yml` with `JWT_SECRET` and `ADMIN_PASSWORD`.
+- **PostgreSQL** runs in its own container with the **`postgres-data`** volume — survives app image rebuilds and updates.
+- The app container connects via `DATABASE_URL`.
+- Copy `.env.example` to `.env` and set `POSTGRES_PASSWORD`, `JWT_SECRET`, and `ADMIN_PASSWORD`.
 
 ## Security notes
 
 - Use **HTTPS** in production (reverse proxy: Caddy, nginx, Traefik, Cloudflare).
-- Change **admin** password and `JWT_SECRET` before going live.
+- Change the **admin** password and `JWT_SECRET` before going live.
 - The API does **not** implement per-field RBAC on every write; roles still control the UI. Treat network access as trusted or add VPN/IP allowlists for sensitive deployments.
 
-## Migrating old browser-only data
+## Migrating from SQLite
 
-If you previously used the app with **localStorage** only, use **Reports → Export full backup** in the old browser, then (optional) we can add an admin import endpoint — or manually merge JSON into the SQLite blobs via a one-off script. Ask if you need an import tool.
+If you previously used `data/suite.db`, export a full backup from the old app (**Reports → Export full backup**), then contact your administrator for a one-time import into PostgreSQL blobs, or run a custom migration script against both databases.
 
 ## Optional: `API_BASE` for split hosting
 

@@ -1,17 +1,16 @@
 {
   "name": "indextech-enterprise-suite",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "Business suite with centralized SQLite API — npm start",
+  "description": "Business suite with centralized PostgreSQL API — npm start",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.105.4",
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^11.7.0",
     "express": "^4.21.2",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1"
   },
   "engines": {
     "node": ">=18"

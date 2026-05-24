@@ -1,44 +1,20 @@
 /**
- * INDEXTECH Enterprise Suite — centralized API + SQLite + static UI
+ * INDEXTECH Enterprise Suite — centralized API + PostgreSQL + static UI
  */
 'use strict';
 
 const path = require('path');
-const fs = require('fs');
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 
 const ROOT = __dirname;
-const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
-fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'suite.db'));
-db.pragma('journal_mode = WAL');
+const DATABASE_URL =
+  process.env.DATABASE_URL || 'postgresql://postgres:KODI1kodi2@localhost:5432/indextech_suite';
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS blobs (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  username TEXT UNIQUE NOT NULL COLLATE NOCASE,
-  display_name TEXT,
-  role TEXT NOT NULL,
-  password_hash TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT,
-  permissions TEXT
-);
-`);
-
-try {
-  db.exec('ALTER TABLE users ADD COLUMN permissions TEXT');
-} catch {
-  /* column already exists */
-}
+const pool = new Pool({ connectionString: DATABASE_URL });
 
 const CO_DEFAULT = {
   name: 'IndexTech Digital Company',
@@ -48,7 +24,7 @@ const CO_DEFAULT = {
   phone: '+255 758 179 958 / +255 712 179 958',
   email: 'info@indextech.co.tz',
   web: 'www.indextech.co.tz',
-  banks: [{ n: 'NMB', a: '329100191849' }, { n: 'CRDB', a: '015C493674500' }],
+  banks: [{ n: 'NMB', a: '32910019849' }, { n: 'CRDB', a: '015C493674500' }],
 };
 
 const DEFAULT_SEQ = { ic: 1, wc: 1, ac: 1, won: 1, qc: 1, tkn: 1, pon: 1 };
@@ -93,7 +69,6 @@ const ROLE_DEFS = {
   viewer: { permissions: ['dashboard', 'calendar', 'reports', 'history'] },
 };
 
-/** All grantable permissions (modules + admin actions). */
 const ALL_PERMISSION_KEYS = [
   'dashboard', 'calendar', 'crm', 'sales', 'quotes', 'invoice', 'inventory', 'warranty', 'service',
   'tickets', 'projects', 'assets', 'finance', 'procurement', 'hr', 'agreement', 'history', 'reports',
@@ -134,36 +109,64 @@ function userHasPerm(auth, key) {
   return perms.includes(key);
 }
 
-function attachAuthPermissions(req, _res, next) {
-  const u = db.prepare('SELECT role, permissions FROM users WHERE id = ?').get(req.auth.userId);
-  if (!u) return next();
-  req.auth.permissions = resolveUserPermissions(u.role, u.permissions);
-  next();
-}
-
-function ensureBlobDefaults() {
-  const ins = db.prepare('INSERT OR IGNORE INTO blobs (key, value) VALUES (?, ?)');
-  ins.run('company', JSON.stringify(CO_DEFAULT));
-  ins.run('seq', JSON.stringify(DEFAULT_SEQ));
-  for (const k of ['crm', 'sales', 'products', 'wo', 'cal', 'quotes', 'tickets', 'projects', 'assets', 'expenses', 'vendors', 'po', 'employees', 'docs']) {
-    ins.run(k, '[]');
+async function attachAuthPermissions(req, _res, next) {
+  try {
+    const { rows } = await pool.query('SELECT role, permissions FROM users WHERE id = $1', [req.auth.userId]);
+    const u = rows[0];
+    if (!u) return next();
+    req.auth.permissions = resolveUserPermissions(u.role, u.permissions);
+    next();
+  } catch (e) {
+    next(e);
   }
 }
 
-function seedAdmin() {
-  const row = db.prepare('SELECT COUNT(*) AS c FROM users').get();
-  if (row.c > 0) return;
-  const pwd = process.env.ADMIN_PASSWORD || 'admin123';
-  const hash = bcrypt.hashSync(pwd, 10);
-  db.prepare(
-    `INSERT INTO users (id, username, display_name, role, password_hash, active, created_at)
-     VALUES (?, ?, ?, ?, ?, 1, ?)`
-  ).run('u_admin', 'admin', 'Administrator', 'admin', hash, new Date().toISOString());
-  console.log('[suite] Seeded admin user (username: admin). Change ADMIN_PASSWORD on first deploy.');
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS blobs (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      display_name TEXT,
+      role TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TEXT,
+      permissions TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (LOWER(username));
+  `);
 }
 
-ensureBlobDefaults();
-seedAdmin();
+async function ensureBlobDefaults() {
+  await pool.query(
+    `INSERT INTO blobs (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
+    ['company', JSON.stringify(CO_DEFAULT)]
+  );
+  await pool.query(
+    `INSERT INTO blobs (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
+    ['seq', JSON.stringify(DEFAULT_SEQ)]
+  );
+  for (const k of ['crm', 'sales', 'products', 'wo', 'cal', 'quotes', 'tickets', 'projects', 'assets', 'expenses', 'vendors', 'po', 'employees', 'docs']) {
+    await pool.query(`INSERT INTO blobs (key, value) VALUES ($1, '[]') ON CONFLICT (key) DO NOTHING`, [k]);
+  }
+}
+
+async function seedAdmin() {
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS c FROM users');
+  if (rows[0].c > 0) return;
+  const pwd = process.env.ADMIN_PASSWORD || 'admin123';
+  const hash = bcrypt.hashSync(pwd, 10);
+  await pool.query(
+    `INSERT INTO users (id, username, display_name, role, password_hash, active, created_at)
+     VALUES ($1, $2, $3, $4, $5, TRUE, $6)`,
+    ['u_admin', 'admin', 'Administrator', 'admin', hash, new Date().toISOString()]
+  );
+  console.log('[suite] Seeded admin user (username: admin). Set ADMIN_PASSWORD on first deploy.');
+}
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 if (JWT_SECRET === 'dev-secret-change-me' && process.env.NODE_ENV === 'production') {
@@ -188,135 +191,16 @@ function requirePerm(key) {
   };
 }
 
-const app = express();
-app.use(express.json({ limit: '50mb' }));
-
-const API_PUBLIC = new Set(['/health', '/auth/login']);
-app.use('/api', (req, res, next) => {
-  if (API_PUBLIC.has(req.path)) return next();
-  authMiddleware(req, res, () => attachAuthPermissions(req, res, next));
-});
-
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
-
-app.get('/api/permissions', (_req, res) => {
-  res.json({ keys: ALL_PERMISSION_KEYS, roles: ROLE_DEFS });
-});
-
-app.post('/api/auth/login', (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-  const u = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(String(username).trim());
-  if (!u || !u.active) return res.status(401).json({ error: 'Invalid username or account disabled' });
-  if (!bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({ error: 'Invalid password' });
-  const permissions = resolveUserPermissions(u.role, u.permissions);
-  const token = jwt.sign(
-    { userId: u.id, username: u.username, role: u.role, displayName: u.display_name || u.username },
-    JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-  res.json({
-    token,
-    user: {
-      id: u.id,
-      username: u.username,
-      displayName: u.display_name || u.username,
-      role: u.role,
-      permissions,
-      customPermissions: u.permissions != null && String(u.permissions).trim() !== '',
-    },
-  });
-});
-
-function parseBlob(key) {
-  const row = db.prepare('SELECT value FROM blobs WHERE key = ?').get(key);
-  if (!row) return [];
+async function parseBlob(key) {
+  const { rows } = await pool.query('SELECT value FROM blobs WHERE key = $1', [key]);
+  if (!rows.length) return [];
   try {
-    const v = JSON.parse(row.value);
+    const v = JSON.parse(rows[0].value);
     return Array.isArray(v) ? v : [];
   } catch {
     return [];
   }
 }
-
-app.get('/api/notify-snapshot', (req, res) => {
-  const wo = parseBlob('wo').map((w) => ({
-    id: w.id,
-    num: w.num,
-    tech: w.tech,
-    customer: w.customer,
-    updated: w.updated,
-  }));
-  const cal = parseBlob('cal').map((e) => ({
-    id: e.id,
-    title: e.title,
-    date: e.date,
-    time: e.time,
-    cat: e.cat,
-  }));
-  const sales = parseBlob('sales').map((s) => ({
-    id: s.id,
-    title: s.title,
-    custName: s.custName,
-    updated: s.updated,
-  }));
-  res.json({ wo, cal, sales });
-});
-
-app.get('/api/state', (req, res) => {
-  const get = (key) => {
-    const row = db.prepare('SELECT value FROM blobs WHERE key = ?').get(key);
-    if (!row) return null;
-    try {
-      return JSON.parse(row.value);
-    } catch {
-      return null;
-    }
-  };
-  const company = get('company');
-  const seq = get('seq');
-  res.json({
-    company: company || CO_DEFAULT,
-    seq: seq || DEFAULT_SEQ,
-    crm: get('crm') || [],
-    sales: get('sales') || [],
-    products: get('products') || [],
-    workOrders: get('wo') || [],
-    cal: get('cal') || [],
-    quotes: get('quotes') || [],
-    tickets: get('tickets') || [],
-    projects: get('projects') || [],
-    assets: get('assets') || [],
-    expenses: get('expenses') || [],
-    vendors: get('vendors') || [],
-    po: get('po') || [],
-    employees: get('employees') || [],
-    docs: get('docs') || [],
-    me: {
-      permissions: req.auth.permissions,
-      role: req.auth.role,
-    },
-  });
-});
-
-const upsertBlob = db.prepare('INSERT INTO blobs (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
-
-app.put('/api/blobs', (req, res) => {
-  const body = req.body || {};
-  const tx = db.transaction(() => {
-    for (const [k, v] of Object.entries(body)) {
-      if (!BLOB_KEYS.has(k)) continue;
-      upsertBlob.run(k, JSON.stringify(v));
-    }
-  });
-  try {
-    tx();
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Save failed' });
-  }
-});
 
 function mapUserRow(r) {
   let permissions = null;
@@ -330,93 +214,270 @@ function mapUserRow(r) {
     username: r.username,
     displayName: r.display_name,
     role: r.role,
-    active: r.active !== 0,
+    active: r.active !== false,
     createdAt: r.created_at,
     permissions,
     customPermissions,
   };
 }
 
-app.get('/api/users', requirePerm('users_manage'), (_req, res) => {
-  const rows = db.prepare('SELECT * FROM users ORDER BY username').all();
-  res.json(rows.map(mapUserRow));
+const app = express();
+app.use(express.json({ limit: '50mb' }));
+
+const API_PUBLIC = new Set(['/health', '/auth/login']);
+app.use('/api', (req, res, next) => {
+  if (API_PUBLIC.has(req.path)) return next();
+  authMiddleware(req, res, () => attachAuthPermissions(req, res, next));
 });
 
-app.post('/api/users', requirePerm('users_manage'), (req, res) => {
-  const { username, displayName, role, password, active, permissions, useRoleDefaults } = req.body || {};
-  const uname = String(username || '')
-    .toLowerCase()
-    .trim();
-  if (!uname) return res.status(400).json({ error: 'Username required' });
-  if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  if (!ROLE_DEFS[role]) return res.status(400).json({ error: 'Invalid role' });
-  const permJson = useRoleDefaults ? null : JSON.stringify(sanitizePermissionsInput(permissions) || roleDefaultPermissions(role));
+app.get('/api/health', async (_req, res) => {
   try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true, db: 'postgresql' });
+  } catch {
+    res.status(503).json({ ok: false, error: 'Database unavailable' });
+  }
+});
+
+app.get('/api/permissions', (_req, res) => {
+  res.json({ keys: ALL_PERMISSION_KEYS, roles: ROLE_DEFS });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+    const { rows } = await pool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [
+      String(username).trim(),
+    ]);
+    const u = rows[0];
+    if (!u || !u.active) return res.status(401).json({ error: 'Invalid username or account disabled' });
+    if (!bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({ error: 'Invalid password' });
+    const permissions = resolveUserPermissions(u.role, u.permissions);
+    const token = jwt.sign(
+      { userId: u.id, username: u.username, role: u.role, displayName: u.display_name || u.username },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    res.json({
+      token,
+      user: {
+        id: u.id,
+        username: u.username,
+        displayName: u.display_name || u.username,
+        role: u.role,
+        permissions,
+        customPermissions: u.permissions != null && String(u.permissions).trim() !== '',
+      },
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+app.get('/api/notify-snapshot', async (_req, res) => {
+  try {
+    const wo = (await parseBlob('wo')).map((w) => ({
+      id: w.id,
+      num: w.num,
+      tech: w.tech,
+      customer: w.customer,
+      status: w.status,
+      updated: w.updated,
+    }));
+    const cal = (await parseBlob('cal')).map((e) => ({
+      id: e.id,
+      title: e.title,
+      date: e.date,
+      time: e.time,
+      cat: e.cat,
+    }));
+    const sales = (await parseBlob('sales')).map((s) => ({
+      id: s.id,
+      title: s.title,
+      custName: s.custName,
+      updated: s.updated,
+    }));
+    const quotes = (await parseBlob('quotes')).map((q) => ({
+      id: q.id,
+      number: q.number,
+      title: q.title,
+      customer: q.customer,
+      updated: q.updated,
+    }));
+    res.json({ wo, cal, sales, quotes });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Snapshot failed' });
+  }
+});
+
+app.get('/api/state', async (req, res) => {
+  try {
+    const get = async (key) => {
+      const { rows } = await pool.query('SELECT value FROM blobs WHERE key = $1', [key]);
+      if (!rows.length) return null;
+      try {
+        return JSON.parse(rows[0].value);
+      } catch {
+        return null;
+      }
+    };
+    const company = await get('company');
+    const seq = await get('seq');
+    res.json({
+      company: company || CO_DEFAULT,
+      seq: seq || DEFAULT_SEQ,
+      crm: (await get('crm')) || [],
+      sales: (await get('sales')) || [],
+      products: (await get('products')) || [],
+      workOrders: (await get('wo')) || [],
+      cal: (await get('cal')) || [],
+      quotes: (await get('quotes')) || [],
+      tickets: (await get('tickets')) || [],
+      projects: (await get('projects')) || [],
+      assets: (await get('assets')) || [],
+      expenses: (await get('expenses')) || [],
+      vendors: (await get('vendors')) || [],
+      po: (await get('po')) || [],
+      employees: (await get('employees')) || [],
+      docs: (await get('docs')) || [],
+      me: {
+        permissions: req.auth.permissions,
+        role: req.auth.role,
+      },
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Load failed' });
+  }
+});
+
+app.put('/api/blobs', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const body = req.body || {};
+    await client.query('BEGIN');
+    for (const [k, v] of Object.entries(body)) {
+      if (!BLOB_KEYS.has(k)) continue;
+      await client.query(
+        `INSERT INTO blobs (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [k, JSON.stringify(v)]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Save failed' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/users', requirePerm('users_manage'), async (_req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM users ORDER BY username');
+    res.json(rows.map(mapUserRow));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Load failed' });
+  }
+});
+
+app.post('/api/users', requirePerm('users_manage'), async (req, res) => {
+  try {
+    const { username, displayName, role, password, active, permissions, useRoleDefaults } = req.body || {};
+    const uname = String(username || '')
+      .toLowerCase()
+      .trim();
+    if (!uname) return res.status(400).json({ error: 'Username required' });
+    if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (!ROLE_DEFS[role]) return res.status(400).json({ error: 'Invalid role' });
+    const permJson = useRoleDefaults
+      ? null
+      : JSON.stringify(sanitizePermissionsInput(permissions) || roleDefaultPermissions(role));
     const hash = bcrypt.hashSync(password, 10);
     const id = 'u' + Date.now();
-    db.prepare(
+    await pool.query(
       `INSERT INTO users (id, username, display_name, role, password_hash, active, created_at, permissions)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, uname, displayName || uname, role, hash, active === false ? 0 : 1, new Date().toISOString(), permJson);
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [id, uname, displayName || uname, role, hash, active === false ? false : true, new Date().toISOString(), permJson]
+    );
     res.json({ ok: true, id });
   } catch (e) {
-    if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(400).json({ error: 'Username already exists' });
-    throw e;
+    if (e.code === '23505') return res.status(400).json({ error: 'Username already exists' });
+    console.error(e);
+    res.status(500).json({ error: 'Create failed' });
   }
 });
 
-app.patch('/api/users/:id', requirePerm('users_manage'), (req, res) => {
-  const { id } = req.params;
-  const { displayName, role, active, password, permissions, useRoleDefaults } = req.body || {};
-  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-  if (!u) return res.status(404).json({ error: 'Not found' });
-  const nextRole = role !== undefined ? role : u.role;
-  if (!ROLE_DEFS[nextRole]) return res.status(400).json({ error: 'Invalid role' });
-  const nextActive = active !== undefined ? (active ? 1 : 0) : u.active;
-  const nextDisp = displayName !== undefined ? displayName : u.display_name;
+app.patch('/api/users/:id', requirePerm('users_manage'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { displayName, role, active, password, permissions, useRoleDefaults } = req.body || {};
+    const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    const u = rows[0];
+    if (!u) return res.status(404).json({ error: 'Not found' });
+    const nextRole = role !== undefined ? role : u.role;
+    if (!ROLE_DEFS[nextRole]) return res.status(400).json({ error: 'Invalid role' });
+    const nextActive = active !== undefined ? active : u.active;
+    const nextDisp = displayName !== undefined ? displayName : u.display_name;
 
-  const wasAdminActive = u.role === 'admin' && u.active === 1;
-  const willBeAdminActive = nextRole === 'admin' && nextActive === 1;
-  if (wasAdminActive && !willBeAdminActive) {
-    const otherAdmins = db.prepare(`SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND active = 1 AND id != ?`).get(id).c;
-    if (otherAdmins === 0) return res.status(400).json({ error: 'Cannot remove the last administrator' });
+    const wasAdminActive = u.role === 'admin' && u.active;
+    const willBeAdminActive = nextRole === 'admin' && nextActive;
+    if (wasAdminActive && !willBeAdminActive) {
+      const { rows: ac } = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM users WHERE role = 'admin' AND active = TRUE AND id != $1`,
+        [id]
+      );
+      if (ac[0].c === 0) return res.status(400).json({ error: 'Cannot remove the last administrator' });
+    }
+
+    let hash = u.password_hash;
+    if (password && String(password).length > 0) {
+      if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      hash = bcrypt.hashSync(password, 10);
+    }
+
+    let nextPerms = u.permissions;
+    if (useRoleDefaults === true) nextPerms = null;
+    else if (permissions !== undefined) {
+      const sanitized = sanitizePermissionsInput(permissions);
+      nextPerms = sanitized ? JSON.stringify(sanitized) : null;
+    }
+
+    await pool.query(
+      `UPDATE users SET display_name = $1, role = $2, active = $3, password_hash = $4, permissions = $5 WHERE id = $6`,
+      [nextDisp, nextRole, nextActive, hash, nextPerms, id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Update failed' });
   }
-
-  let hash = u.password_hash;
-  if (password && String(password).length > 0) {
-    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    hash = bcrypt.hashSync(password, 10);
-  }
-
-  let nextPerms = u.permissions;
-  if (useRoleDefaults === true) nextPerms = null;
-  else if (permissions !== undefined) {
-    const sanitized = sanitizePermissionsInput(permissions);
-    nextPerms = sanitized ? JSON.stringify(sanitized) : null;
-  }
-
-  db.prepare(`UPDATE users SET display_name = ?, role = ?, active = ?, password_hash = ?, permissions = ? WHERE id = ?`).run(
-    nextDisp,
-    nextRole,
-    nextActive,
-    hash,
-    nextPerms,
-    id
-  );
-  res.json({ ok: true });
 });
 
-app.delete('/api/users/:id', requirePerm('users_manage'), (req, res) => {
-  const { id } = req.params;
-  if (req.auth.userId === id) return res.status(400).json({ error: 'You cannot delete your own account' });
-  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-  if (!u) return res.status(404).json({ error: 'Not found' });
-  const admins = db.prepare(`SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND active = 1`).get().c;
-  if (u.role === 'admin' && u.active === 1 && admins <= 1) {
-    return res.status(400).json({ error: 'Cannot delete the last administrator' });
+app.delete('/api/users/:id', requirePerm('users_manage'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (req.auth.userId === id) return res.status(400).json({ error: 'You cannot delete your own account' });
+    const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    const u = rows[0];
+    if (!u) return res.status(404).json({ error: 'Not found' });
+    const { rows: ac } = await pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE role = 'admin' AND active = TRUE`);
+    if (u.role === 'admin' && u.active && ac[0].c <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last administrator' });
+    }
+    await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Delete failed' });
   }
-  db.prepare('DELETE FROM users WHERE id = ?').run(id);
-  res.json({ ok: true });
 });
 
 app.use(express.static(ROOT, { index: false }));
@@ -427,6 +488,17 @@ app.get('*', (req, res, next) => {
 });
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
-app.listen(PORT, () => {
-  console.log(`INDEXTECH suite → http://localhost:${PORT}  (data: ${DATA_DIR})`);
+
+async function start() {
+  await initDb();
+  await ensureBlobDefaults();
+  await seedAdmin();
+  app.listen(PORT, () => {
+    console.log(`INDEXTECH suite → http://localhost:${PORT}  (PostgreSQL)`);
+  });
+}
+
+start().catch((err) => {
+  console.error('[suite] Failed to start:', err.message);
+  process.exit(1);
 });
